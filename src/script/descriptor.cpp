@@ -2290,6 +2290,8 @@ struct KeyParser {
     const SigningProvider* m_in;
     //! List of multipath expanded keys contained in the Miniscript.
     mutable std::vector<std::vector<std::unique_ptr<PubkeyProvider>>> m_keys;
+    //! Multipath branch used when comparing and formatting keys
+    size_t m_multipath_index{0};
     //! Used to detect key parsing errors within a Miniscript.
     mutable std::string m_key_parsing_error;
     //! The script context we're operating within (Tapscript or P2WSH).
@@ -2305,8 +2307,8 @@ struct KeyParser {
         // Deriving a hardened step needs the private key, so use the provider that was filled
         // while parsing, or the one we are inferring from, rather than an empty one.
         const SigningProvider& provider{m_out ? *m_out : (m_in ? *m_in : DUMMY_SIGNING_PROVIDER)};
-        const PubkeyProvider& key_a{*m_keys.at(a).at(0)};
-        const PubkeyProvider& key_b{*m_keys.at(b).at(0)};
+        const PubkeyProvider& key_a{*m_keys.at(a).at(m_multipath_index)};
+        const PubkeyProvider& key_b{*m_keys.at(b).at(m_multipath_index)};
         FlatSigningProvider out_a, out_b;
         const std::optional<CPubKey> pub_a{key_a.GetPubKey(0, provider, out_a)};
         const std::optional<CPubKey> pub_b{key_b.GetPubKey(0, provider, out_b)};
@@ -2337,7 +2339,7 @@ struct KeyParser {
 
     std::optional<std::string> ToString(const Key& key, bool&) const
     {
-        return m_keys.at(key).at(0)->ToString(PubkeyProvider::StringType::PUBLIC);
+        return m_keys.at(key).at(m_multipath_index)->ToString(PubkeyProvider::StringType::PUBLIC);
     }
 
     template<typename I> std::optional<Key> FromPKBytes(I begin, I end) const
@@ -2784,6 +2786,16 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
                     }
                 } else if (vec.size() != num_multipath) {
                     error = strprintf("Miniscript: Multipath derivation paths have mismatched lengths");
+                    return {};
+                }
+            }
+
+            // Recheck duplicate keys after multipath expansion, since parsing checked only branch 0
+            for (size_t i{1}; i < num_multipath; ++i) {
+                parser.m_multipath_index = i;
+                node->DuplicateKeyCheck(parser);
+                if (!node->CheckDuplicateKey()) {
+                    error = *node->FindInsaneSub()->ToString(parser) + " is not sane: contains duplicate public keys";
                     return {};
                 }
             }
