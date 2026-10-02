@@ -7,6 +7,7 @@
 from decimal import Decimal
 from itertools import product
 from random import randbytes
+import re
 
 from test_framework.address import base58_to_byte
 from test_framework.blocktools import (
@@ -880,6 +881,40 @@ class PSBTTest(BitcoinTestFramework):
         # Load the default wallet back for later test cases.
         self.nodes[0].loadwallet(self.default_wallet_name)
 
+    def test_global_xpubs(self):
+        self.log.info("Test that the wallet fills in the extended public keys of its descriptors")
+        node = self.nodes[0]
+        default = node.get_wallet_rpc(self.default_wallet_name)
+        default.walletpassphrase(passphrase="password", timeout=100)
+        node.createwallet("global_xpubs")
+        wallet = node.get_wallet_rpc("global_xpubs")
+        address_types = {wallet.getnewaddress(address_type=t): t for t in ["legacy", "p2sh-segwit", "bech32", "bech32m"]}
+        for address in address_types:
+            default.sendtoaddress(address, 1)
+        self.generate(node, 1)
+        outputs = [{default.getnewaddress(): 0.5}]
+
+        account_xpubs = {}
+        for utxo in wallet.listunspent():
+            address_type = address_types[utxo["address"]]
+            parent_desc = wallet.getaddressinfo(utxo["address"])["parent_desc"]
+            fingerprint, path, xpub = re.search(r"\[(\w{8})/([^\]]*)\](\w+)/", parent_desc).groups()
+            account_xpubs[address_type] = (utxo, xpub)
+            # The change goes to the internal descriptor of the same type, which has the same account key
+            psbt = wallet.walletcreatefundedpsbt(inputs=[utxo], outputs=outputs, change_type=address_type)
+            assert_greater_than(psbt["changepos"], -1)
+            assert_equal(node.decodepsbt(psbt["psbt"])["global_xpubs"], [{"xpub": xpub, "master_fingerprint": fingerprint, "path": f"m/{path}"}])
+            psbt = wallet.walletcreatefundedpsbt(inputs=[utxo], outputs=outputs, bip32derivs=False)
+            assert_equal(node.decodepsbt(psbt["psbt"])["global_xpubs"], [])
+
+        self.log.info("Test that a key whose path does not match its depth is left out")
+        utxo, xpub = account_xpubs["bech32"]
+        node.createwallet("global_xpubs_no_origin", disable_private_keys=True)
+        watch_only = node.get_wallet_rpc("global_xpubs_no_origin")
+        assert watch_only.importdescriptors([{"desc": descsum_create(f"wpkh({xpub}/0/*)"), "timestamp": 0, "active": True}])[0]["success"]
+        psbt = watch_only.walletcreatefundedpsbt(inputs=[utxo], outputs=outputs, changeAddress=default.getnewaddress())
+        assert_equal(node.decodepsbt(psbt["psbt"])["global_xpubs"], [])
+
     def run_test(self):
         # Create and fund a raw tx for sending 10 BTC
         psbtx1 = self.nodes[0].walletcreatefundedpsbt([], {self.nodes[2].getnewaddress():10})['psbt']
@@ -1472,7 +1507,9 @@ class PSBTTest(BitcoinTestFramework):
         conflict_second_obj = PSBT.from_base64(psbt2)
         conflict_second_obj.g.map[xpub_key1] = b"\x11\x11\x11\x11"
         joined_conflict = self.nodes[0].joinpsbts([conflict_first_obj.to_base64(), conflict_second_obj.to_base64()])
-        assert_equal(self.nodes[0].decodepsbt(joined_conflict)["global_xpubs"], [{"xpub": xpub1, "master_fingerprint": "00000000", "path": "m"}])
+        # psbt2 also carries the extended public key of the wallet that processed it
+        joined_xpubs = self.nodes[0].decodepsbt(joined_conflict)["global_xpubs"]
+        assert_equal([x for x in joined_xpubs if x["xpub"] == xpub1], [{"xpub": xpub1, "master_fingerprint": "00000000", "path": "m"}])
 
         # Newly created PSBT needs UTXOs and updating
         addr = self.nodes[1].getnewaddress("", "p2sh-segwit")
@@ -1823,6 +1860,7 @@ class PSBTTest(BitcoinTestFramework):
         self.test_psbt_version()
         self.test_psbt_with_invalid_signature()
         self.test_musig2_untrusted_derivation()
+        self.test_global_xpubs()
 
 if __name__ == '__main__':
     PSBTTest(__file__).main()

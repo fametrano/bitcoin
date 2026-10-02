@@ -1395,6 +1395,9 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
     if (n_signed) {
         *n_signed = 0;
     }
+    // Whether an input or an output, change included, uses this descriptor, so that its
+    // extended keys belong in the PSBT
+    bool contributes_to_psbt = false;
     for (unsigned int i = 0; i < psbtx.inputs.size(); ++i) {
         PSBTInput& input = psbtx.inputs.at(i);
 
@@ -1419,8 +1422,10 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
         std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
         std::unique_ptr<FlatSigningProvider> script_keys = GetSigningProvider(script, /*include_private=*/options.sign);
         if (script_keys) {
+            contributes_to_psbt = true;
             keys->Merge(std::move(*script_keys));
         } else {
+            // The script is not ours, so this does not count as contributing.
             // Maybe there are pubkeys listed that we can sign for
             std::vector<CPubKey> pubkeys;
             pubkeys.reserve(input.hd_keypaths.size() + 2);
@@ -1479,7 +1484,20 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
         if (!keys) {
             continue;
         }
+        contributes_to_psbt = true;
         UpdatePSBTOutput(HidingSigningProvider(keys.get(), /*hide_secret=*/true, /*hide_origin=*/!options.bip32_derivs), psbtx, i);
+    }
+
+    if (contributes_to_psbt && options.bip32_derivs) {
+        LOCK(cs_desc_man);
+        for (const auto& [origin, xpubs] : m_wallet_descriptor.descriptor->GetExtPubKeysWithOrigins(&m_wallet_descriptor.cache)) {
+            for (CExtPubKey xpub : xpubs) {
+                // BIP 174 requires the path to have as many steps as the key's depth
+                if (origin.path.size() != xpub.nDepth) continue;
+                SetExtPubKeyVersion(xpub);
+                psbtx.m_xpubs[origin].insert(xpub);
+            }
+        }
     }
 
     return {};

@@ -21,6 +21,9 @@ std::string EncodeExtKey(const CExtKey& extkey);
 CExtPubKey DecodeExtPubKey(const std::string& str);
 std::string EncodeExtPubKey(const CExtPubKey& extpubkey);
 
+/** Set the version bytes of an extended public key to this network's, which a PSBT serializes. */
+void SetExtPubKeyVersion(CExtPubKey& extpubkey);
+
 std::string EncodeDestination(const CTxDestination& dest);
 CTxDestination DecodeDestination(const std::string& str);
 CTxDestination DecodeDestination(const std::string& str, std::string& error_msg, std::vector<int>* error_locations = nullptr);

@@ -21,6 +21,7 @@ ORIGIN_PATH_RE = re.compile(r"^\[\w{8}(/.*)\].*$")
 MULTIPATH_TWO_RE = re.compile(r"<(\d+);(\d+)>")
 MUSIG_RE = re.compile(r"musig\((.*?)\)")
 PLACEHOLDER_RE = re.compile(r"\$\d")
+GLOBAL_XPUB_RE = re.compile(r"^\[(\w{8})/(.*)\](\w+)$")
 
 class WalletMuSigTest(BitcoinTestFramework):
     wallet_num = 0
@@ -256,6 +257,11 @@ class WalletMuSigTest(BitcoinTestFramework):
         dec_psbt = self.nodes[0].decodepsbt(psbt)
         assert_equal(len(dec_psbt["inputs"]), 1)
         assert_equal(len(dec_psbt["inputs"][0]["musig2_participant_pubkeys"]), expected_participant_maps)
+        # The extended public key of every participant, with its origin
+        participants = {int(p[1:]) for musig in MUSIG_RE.findall(pat) for p in PLACEHOLDER_RE.findall(musig)}
+        expected_xpubs = [GLOBAL_XPUB_RE.match(keys[i][1]).groups() for i in participants]
+        assert_equal(sorted((x["master_fingerprint"], x["path"], x["xpub"]) for x in dec_psbt["global_xpubs"]),
+                     sorted((fingerprint, f"m/{path}", xpub) for fingerprint, path, xpub in expected_xpubs))
         if has_internal:
             assert_equal(len(dec_psbt["outputs"][1]["musig2_participant_pubkeys"]), expected_participant_maps)
 
