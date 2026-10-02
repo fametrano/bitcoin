@@ -7,11 +7,13 @@
 
 #include <outputtype.h>
 #include <pubkey.h>
+#include <script/keyorigin.h>
 #include <uint256.h>
 #include <util/expected.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -197,6 +199,12 @@ struct Descriptor {
      * @param[out] ext_pubs Any extended public keys
      */
     virtual void GetPubKeys(std::set<CPubKey>& pubkeys, std::set<CExtPubKey>& ext_pubs) const = 0;
+
+    /** Return the extended public keys of this descriptor, including any from subdescriptors,
+     *  keyed by their origin. For each key expression this is the key at its last hardened
+     *  derivation step when the cache holds it, and the root key otherwise.
+     */
+    virtual std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const = 0;
 
     /** Whether this descriptor produces any scripts with the Expand functions */
     virtual bool HasScripts() const = 0;

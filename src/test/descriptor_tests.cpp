@@ -2,10 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <key_io.h>
 #include <pubkey.h>
 #include <script/descriptor.h>
 #include <script/sign.h>
 #include <test/util/setup_common.h>
+#include <util/bip32.h>
 #include <util/check.h>
 #include <util/strencodings.h>
 #include <util/string.h>
@@ -14,7 +16,9 @@
 
 #include <optional>
 #include <regex>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace util::hex_literals;
@@ -1473,6 +1477,79 @@ BOOST_AUTO_TEST_CASE(unused_descriptor_test)
     CheckUnused("unused(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc)", "unused(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL)");
     CheckUnused("unused(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1)", "unused(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd)");
     CheckUnused("unused(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/0h/0h/1)", "unused(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/0h/0h/1)");
+}
+
+/** The extended public keys of a descriptor, as (origin, xpub) strings, read with or without
+ *  the cache that expanding it fills. */
+static std::set<std::pair<std::string, std::string>> ExtPubKeysWithOrigins(const std::string& desc_str, bool use_cache)
+{
+    FlatSigningProvider keys;
+    std::string error;
+    const auto descs{Parse(desc_str, keys, error, /*require_checksum=*/false)};
+    BOOST_REQUIRE_MESSAGE(descs.size() == 1, error);
+    DescriptorCache cache;
+    if (use_cache) {
+        std::vector<CScript> scripts;
+        FlatSigningProvider out;
+        BOOST_REQUIRE(descs.at(0)->Expand(0, keys, scripts, out, &cache));
+    }
+    std::set<std::pair<std::string, std::string>> ret;
+    for (const auto& [origin, xpubs] : descs.at(0)->GetExtPubKeysWithOrigins(use_cache ? &cache : nullptr)) {
+        for (const CExtPubKey& xpub : xpubs) {
+            ret.emplace(HexStr(origin.fingerprint) + FormatHDKeypath(origin.path), EncodeExtPubKey(xpub));
+        }
+    }
+    return ret;
+}
+
+static void CheckExtPubKeys(const std::string& desc_str, const std::set<std::pair<std::string, std::string>>& without_cache, const std::set<std::pair<std::string, std::string>>& with_cache)
+{
+    BOOST_CHECK_MESSAGE(ExtPubKeysWithOrigins(desc_str, /*use_cache=*/false) == without_cache, desc_str);
+    BOOST_CHECK_MESSAGE(ExtPubKeysWithOrigins(desc_str, /*use_cache=*/true) == with_cache, desc_str);
+}
+
+static std::string Fingerprint(const std::string& xpub)
+{
+    return HexStr(DecodeExtPubKey(xpub).pubkey.GetID().fingerprint());
+}
+
+static std::string DeriveExtPubKey(const std::string& xprv, const std::vector<uint32_t>& path)
+{
+    CExtKey key{DecodeExtKey(xprv)};
+    for (const uint32_t step : path) {
+        BOOST_REQUIRE(key.Derive(key, step));
+    }
+    return EncodeExtPubKey(key.Neuter());
+}
+
+BOOST_AUTO_TEST_CASE(descriptor_extpubkeys_with_origins)
+{
+    const std::string XPRV{"xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc"};
+    const std::string XPUB{"xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL"};
+    const std::string XPUB2{"xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y"};
+    const std::string FP{Fingerprint(XPUB)};
+    const std::string FP2{Fingerprint(XPUB2)};
+    const std::string LH_84H_0H_0H{DeriveExtPubKey(XPRV, {84 | BIP32_HARDENED_FLAG, BIP32_HARDENED_FLAG, BIP32_HARDENED_FLAG})};
+    const std::string LH_0H{DeriveExtPubKey(XPRV, {BIP32_HARDENED_FLAG})};
+
+    // Without hardened derivation, the root key
+    CheckExtPubKeys("wpkh(" + XPUB + "/0/*)", {{FP, XPUB}}, {{FP, XPUB}});
+    // With hardened derivation, the key at the last hardened step when the cache has it
+    CheckExtPubKeys("wpkh(" + XPRV + "/84h/0h/0h/0/*)", {{FP, XPUB}}, {{FP + "/84h/0h/0h", LH_84H_0H_0H}});
+    CheckExtPubKeys("pkh(" + XPRV + "/0h)", {{FP, XPUB}}, {{FP + "/0h", LH_0H}});
+    // The cache has no such key for hardened ranged derivation
+    CheckExtPubKeys("wpkh(" + XPRV + "/0h/*h)", {{FP, XPUB}}, {{FP, XPUB}});
+    // A key origin comes first
+    CheckExtPubKeys("wpkh([00aabb22/48h]" + XPUB + "/0/*)", {{"00aabb22/48h", XPUB}}, {{"00aabb22/48h", XPUB}});
+    CheckExtPubKeys("wpkh([00aabb22/48h]" + XPRV + "/0h/0/*)", {{"00aabb22/48h", XPUB}}, {{"00aabb22/48h/0h", LH_0H}});
+    // Every key expression, including those in subdescriptors and script paths
+    CheckExtPubKeys("sh(wsh(multi(2," + XPUB + "/0/*," + XPUB2 + "/0/*)))", {{FP, XPUB}, {FP2, XPUB2}}, {{FP, XPUB}, {FP2, XPUB2}});
+    CheckExtPubKeys("tr(" + XPUB + "/0/*,pk(" + XPUB2 + "/0/*))", {{FP, XPUB}, {FP2, XPUB2}}, {{FP, XPUB}, {FP2, XPUB2}});
+    // The participants of a musig()
+    CheckExtPubKeys("rawtr(musig(" + XPUB + "," + XPUB2 + ")/0/*)", {{FP, XPUB}, {FP2, XPUB2}}, {{FP, XPUB}, {FP2, XPUB2}});
+    CheckExtPubKeys("rawtr(musig(" + XPRV + "/0h/1," + XPUB2 + "/2))", {{FP, XPUB}, {FP2, XPUB2}}, {{FP + "/0h", LH_0H}, {FP2, XPUB2}});
+    // A plain public key has none
+    CheckExtPubKeys("wpkh(03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd)", {}, {});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -255,6 +255,9 @@ public:
     /** Return the extended public key for this PubkeyProvider, if it has one. */
     virtual std::optional<CExtPubKey> GetRootExtPubKey() const = 0;
 
+    /** Return the extended public keys of this PubkeyProvider, keyed by their origin. */
+    virtual std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const = 0;
+
     /** Make a deep copy of this PubkeyProvider */
     virtual std::unique_ptr<PubkeyProvider> Clone() const = 0;
 
@@ -359,6 +362,16 @@ public:
     {
         return m_provider->GetRootExtPubKey();
     }
+    std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const override
+    {
+        std::map<KeyOriginInfo, std::set<CExtPubKey>> ret;
+        for (auto& [suborigin, xpubs] : m_provider->GetExtPubKeysWithOrigins(cache)) {
+            KeyOriginInfo origin{m_origin};
+            origin.path.insert(origin.path.end(), suborigin.path.begin(), suborigin.path.end());
+            ret[origin].merge(xpubs);
+        }
+        return ret;
+    }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<OriginPubkeyProvider>(m_expr_index, m_origin, m_provider->Clone(), m_apostrophe);
@@ -423,6 +436,10 @@ public:
     std::optional<CExtPubKey> GetRootExtPubKey() const override
     {
         return std::nullopt;
+    }
+    std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache*) const override
+    {
+        return {};
     }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
@@ -644,6 +661,21 @@ public:
     {
         return m_root_extkey;
     }
+    std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const override
+    {
+        KeyOriginInfo origin;
+        origin.fingerprint = m_root_extkey.id_key_fingerprint();
+        CExtPubKey xpub;
+        if (cache && cache->GetCachedLastHardenedExtPubKey(m_expr_index, xpub)) {
+            // The key's depth says how many steps of the path lead to it
+            const size_t steps(xpub.nDepth - m_root_extkey.nDepth);
+            if (Assume(steps <= m_path.size())) {
+                origin.path.assign(m_path.begin(), m_path.begin() + steps);
+                return {{origin, {xpub}}};
+            }
+        }
+        return {{origin, {m_root_extkey}}};
+    }
     std::unique_ptr<PubkeyProvider> Clone() const override
     {
         return std::make_unique<BIP32PubkeyProvider>(m_expr_index, m_root_extkey, m_path, m_derive, m_apostrophe);
@@ -837,6 +869,16 @@ public:
     std::optional<CExtPubKey> GetRootExtPubKey() const override
     {
         return std::nullopt;
+    }
+    std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const override
+    {
+        std::map<KeyOriginInfo, std::set<CExtPubKey>> ret;
+        for (const auto& prov : m_participants) {
+            for (auto& [origin, xpubs] : prov->GetExtPubKeysWithOrigins(cache)) {
+                ret[origin].merge(xpubs);
+            }
+        }
+        return ret;
     }
 
     std::unique_ptr<PubkeyProvider> Clone() const override
@@ -1114,6 +1156,23 @@ public:
         for (const auto& arg : m_subdescriptor_args) {
             arg->GetPubKeys(pubkeys, ext_pubs);
         }
+    }
+
+    // NOLINTNEXTLINE(misc-no-recursion)
+    std::map<KeyOriginInfo, std::set<CExtPubKey>> GetExtPubKeysWithOrigins(const DescriptorCache* cache) const override
+    {
+        std::map<KeyOriginInfo, std::set<CExtPubKey>> ret;
+        for (const auto& p : m_pubkey_args) {
+            for (auto& [origin, xpubs] : p->GetExtPubKeysWithOrigins(cache)) {
+                ret[origin].merge(xpubs);
+            }
+        }
+        for (const auto& sub : m_subdescriptor_args) {
+            for (auto& [origin, xpubs] : sub->GetExtPubKeysWithOrigins(cache)) {
+                ret[origin].merge(xpubs);
+            }
+        }
+        return ret;
     }
 
     virtual std::unique_ptr<DescriptorImpl> Clone() const = 0;
