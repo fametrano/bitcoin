@@ -22,6 +22,7 @@ enum class Warning;
 namespace node {
 enum class Warning {
     CLOCK_OUT_OF_SYNC,
+    CLOCK_BEHIND_BLOCK_INDEX,
     PRE_RELEASE_TEST_BUILD,
     FATAL_INTERNAL_ERROR,
 };

@@ -62,6 +62,7 @@
 #include <util/time.h>
 #include <util/tokenbucket.h>
 #include <util/trace.h>
+#include <util/translation.h>
 #include <validation.h>
 
 #include <algorithm>
@@ -593,7 +594,7 @@ public:
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, !m_clock_behind_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
     bool SendMessages(CNode& node) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
@@ -622,7 +623,7 @@ public:
 private:
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, !m_clock_behind_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_inv_to_send_mutex);
 
     /** Consider evicting an outbound peer based on the amount of time they've been behind our tip */
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
@@ -734,7 +735,7 @@ private:
     void ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                                std::vector<CBlockHeader>&& headers,
                                bool via_compact_block)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, g_msgproc_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_clock_behind_mutex, g_msgproc_mutex);
     /** Various helpers for headers processing, invoked by ProcessHeadersMessage() */
     /** Return true if headers are continuous and have valid proof-of-work (DoS points assigned on failure) */
     bool CheckHeadersPoW(const std::vector<CBlockHeader>& headers, Peer& peer);
@@ -781,7 +782,7 @@ private:
     bool TryLowWorkHeadersSync(Peer& peer, CNode& pfrom,
                                const CBlockIndex& chain_start_header,
                                std::vector<CBlockHeader>& headers)
-        EXCLUSIVE_LOCKS_REQUIRED(!peer.m_headers_sync_mutex, !m_peer_mutex, !m_headers_presync_mutex, g_msgproc_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!peer.m_headers_sync_mutex, !m_peer_mutex, !m_headers_presync_mutex, !m_clock_behind_mutex, g_msgproc_mutex);
 
     /** Return true if the given header is an ancestor of
      *  m_chainman.m_best_header or our current tip */
@@ -1039,6 +1040,19 @@ private:
 
     /** When our tip was last updated. */
     std::atomic<std::chrono::seconds> m_last_tip_update{0s};
+
+    /** Guards m_clock_behind_mtp together with the CLOCK_BEHIND_BLOCK_INDEX warning. The message handler
+     *  thread sets both in TryLowWorkHeadersSync(); the scheduler thread clears both in
+     *  MaybeClearClockBehindWarning(), whether or not a peer is connected. */
+    Mutex m_clock_behind_mutex;
+
+    /** The highest median time past of a chain start for which a headers sync could not start because
+     *  our clock was too far behind it, since the warning was last cleared, or 0 if there was none. */
+    int64_t m_clock_behind_mtp GUARDED_BY(m_clock_behind_mutex){0};
+
+    /** Clear the CLOCK_BEHIND_BLOCK_INDEX warning once our clock is no longer more than
+     *  MAX_FUTURE_BLOCK_TIME behind m_clock_behind_mtp. */
+    void MaybeClearClockBehindWarning() EXCLUSIVE_LOCKS_REQUIRED(!m_clock_behind_mutex);
 
     /** Determine whether or not a peer can request a transaction, and return it (or nullptr if not found or not allowed). */
     CTransactionRef FindTxForGetData(const Peer::TxRelay& tx_relay, const GenTxid& gtxid)
@@ -2159,6 +2173,8 @@ void PeerManagerImpl::StartScheduledTasks(CScheduler& scheduler)
     static_assert(EXTRA_PEER_CHECK_INTERVAL < STALE_CHECK_INTERVAL, "peer eviction timer should be less than stale tip check timer");
     scheduler.scheduleEvery([this] { this->CheckForStaleTipAndEvictPeers(); }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
 
+    scheduler.scheduleEvery([this] { this->MaybeClearClockBehindWarning(); }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
+
     // schedule next run for 10-15 minutes in the future
     const auto delta = 10min + FastRandomContext().randrange<std::chrono::milliseconds>(5min);
     scheduler.scheduleFromNow([&] { ReattemptInitialBroadcast(scheduler); }, delta);
@@ -3038,14 +3054,30 @@ bool PeerManagerImpl::TryLowWorkHeadersSync(Peer& peer, CNode& pfrom, const CBlo
                 peer.m_headers_sync.reset(new HeadersSyncState(peer.m_id, m_chainparams.GetConsensus(),
                     m_chainparams.HeadersSync(), chain_start_header, minimum_chain_work));
             } catch (const HeadersSyncState::SystemClockError& e) {
-                // The chain state loading logic performs an earlier check to
-                // verify that the tip of the locally stored chain is <=
-                // system clock + MAX_FUTURE_BLOCK_TIME.
-                // But if we have no pre-existing chain state we might get here.
-                const auto msg{strprintf("Failure when attempting to initiate headers sync: %s", e.what())};
-                std::cerr << msg << std::endl;
-                LogError("%s", msg);
-                std::abort();
+                // The peer chooses the chain start, so it can pick a block
+                // whose MTP is ahead of our clock even when our tip is not,
+                // for example after the clock stepped back while running.
+                // On a fresh datadir no chainstate check has compared our
+                // clock with the block index yet, so we can also get here.
+                // Ignore the headers, as for any other low-work chain, and
+                // keep a warning visible until our clock catches up.
+                const bilingual_str msg{strprintf(_(
+                    "Your computer's date and time are more than %d minutes behind a block in the block index. "
+                    "Please check your computer's clock."
+                ), MAX_FUTURE_BLOCK_TIME / 60)};
+                bool newly_set;
+                {
+                    LOCK(m_clock_behind_mutex);
+                    m_clock_behind_mtp = std::max<int64_t>(m_clock_behind_mtp, chain_start_header.GetMedianTimePast());
+                    newly_set = m_warnings.Set(node::Warning::CLOCK_BEHIND_BLOCK_INDEX, msg);
+                }
+                if (newly_set) {
+                    LogWarning("Ignoring low-work headers from peer=%d: %s", pfrom.GetId(), e.what());
+                } else {
+                    LogDebug(BCLog::NET, "Ignoring low-work headers from peer=%d: %s", pfrom.GetId(), e.what());
+                }
+                headers = {};
+                return true;
             }
 
             // Now a HeadersSyncState object for tracking this synchronization
@@ -5667,6 +5699,16 @@ void PeerManagerImpl::EvictExtraOutboundPeers(NodeClock::time_point now)
                 m_connman.SetTryNewOutboundPeer(false);
             }
         }
+    }
+}
+
+void PeerManagerImpl::MaybeClearClockBehindWarning()
+{
+    LOCK(m_clock_behind_mutex);
+    if (m_clock_behind_mtp != 0 &&
+        TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()) + MAX_FUTURE_BLOCK_TIME >= m_clock_behind_mtp) {
+        m_clock_behind_mtp = 0;
+        m_warnings.Unset(node::Warning::CLOCK_BEHIND_BLOCK_INDEX);
     }
 }
 

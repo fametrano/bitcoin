@@ -22,11 +22,15 @@ from test_framework.blocktools import (
 
 from test_framework.util import assert_equal
 
-import re
 import time
 
 NODE1_BLOCKS_REQUIRED = 15
 NODE2_BLOCKS_REQUIRED = 2047
+EXTRA_PEER_CHECK_INTERVAL = 45  # seconds, the scheduler interval in net_processing.cpp
+
+
+def clock_warning(node):
+    return any("behind a block in the block index" in warning for warning in node.getnetworkinfo()["warnings"])
 
 
 class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
@@ -146,15 +150,98 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         # getpeerinfo should show a sync in progress
         assert_equal(node.getpeerinfo()[0]['presynced_headers'], 2000)
 
-        self.log.info("Test whether a lagging clock aborts low-work headers sync")
+        self.log.info("Test that a lagging clock does not stop the node, but no low-work headers sync starts")
         node.disconnect_p2ps()
         node.setmocktime(node.getblockheader(node.getblockhash(0))['mediantime'] - MAX_FUTURE_BLOCK_TIME - 1)
         p2p = node.add_p2p_connection(P2PInterface())
-        p2p.send_without_ping(headers_message)
-        node.wait_until_stopped(expect_error=True, expected_ret_code=[-6,          # Unix
-                                                                      3,           # Windows native
-                                                                      0xC0000409], # Windows cross builds
-                                expected_stderr=re.compile("Failure when attempting to initiate headers sync: System clock"))
+        with node.assert_debug_log(expected_msgs=["[warning] Ignoring low-work headers from peer=", "System clock is more than"]):
+            p2p.send_and_ping(headers_message)
+        assert_equal(node.getpeerinfo()[0]['presynced_headers'], -1)
+        assert clock_warning(node)
+
+        self.log.info("Test that the warning clears once the clock is no longer behind, with no peer connected")
+        node.disconnect_p2ps()
+        node.setmocktime(0)
+        node.mockscheduler(EXTRA_PEER_CHECK_INTERVAL)
+        self.wait_until(lambda: not clock_warning(node))
+        assert_equal(node.getpeerinfo(), [])
+
+        self.log.info("Test that the headers sync starts once the clock is correct again")
+        p2p = node.add_p2p_connection(P2PInterface())
+        p2p.send_and_ping(headers_message)
+        assert_equal(node.getpeerinfo()[0]['presynced_headers'], 2000)
+
+    def test_clock_warning_clears_at_highest_chain_start(self):
+        self.log.info("Test that the warning stays until the clock catches up with the highest chain start")
+        node = self.nodes[0]
+        node.disconnect_p2ps()
+
+        # Headers-only fork from genesis, ahead of our tip, so that its blocks
+        # at height 1 and 3 have different MTPs.
+        tip_time = node.getblockheader(node.getbestblockhash())['time']
+        node.setmocktime(tip_time + 3000)
+        chain_starts = []
+        prev = int(node.getblockhash(0), 16)
+        for height in range(1, 4):
+            block = create_block(prev, ntime=tip_time + 1000 * height, height=height)
+            block.solve()
+            node.submitheader(block.serialize()[:80].hex())
+            chain_starts.append(block)
+            prev = block.hash_int
+        mtp_low = node.getblockheader(chain_starts[0].hash_hex)['mediantime']
+        mtp_high = node.getblockheader(chain_starts[2].hash_hex)['mediantime']
+        assert mtp_low < mtp_high
+
+        def low_work_headers(start_hash, start_time):
+            headers = []
+            prev = start_hash
+            for i in range(2000):
+                block = create_block(prev, ntime=start_time + 1 + i, height=1)
+                block.solve()
+                headers.append(block)
+                prev = block.hash_int
+            return msg_headers(headers=headers)
+
+        # Our tip is within the limit; only the chain starts are ahead of the clock.
+        clock = mtp_low - MAX_FUTURE_BLOCK_TIME - 1
+        assert tip_time <= clock + MAX_FUTURE_BLOCK_TIME
+        node.setmocktime(clock)
+        p2p = node.add_p2p_connection(P2PInterface())
+        p2p.send_and_ping(low_work_headers(chain_starts[2].hash_int, chain_starts[2].nTime))
+        assert clock_warning(node)
+        with node.assert_debug_log(expected_msgs=["[net] Ignoring low-work headers"], unexpected_msgs=["[warning] Ignoring low-work headers"]):
+            p2p.send_and_ping(low_work_headers(chain_starts[0].hash_int, chain_starts[0].nTime))
+        assert_equal(node.getpeerinfo()[0]['presynced_headers'], -1)
+
+        # A presync from a chain start within the limit still starts while the warning is set.
+        genesis = node.getblockheader(node.getblockhash(0))
+        p2p.send_and_ping(low_work_headers(int(genesis['hash'], 16), genesis['time']))
+        assert_equal(node.getpeerinfo()[0]['presynced_headers'], 2000)
+        assert clock_warning(node)
+
+        node.setmocktime(mtp_low - MAX_FUTURE_BLOCK_TIME)
+        node.mockscheduler(EXTRA_PEER_CHECK_INTERVAL)
+        assert clock_warning(node)
+
+        node.setmocktime(mtp_high - MAX_FUTURE_BLOCK_TIME - 1)
+        node.mockscheduler(EXTRA_PEER_CHECK_INTERVAL)
+        assert clock_warning(node)
+
+        node.setmocktime(mtp_high - MAX_FUTURE_BLOCK_TIME)
+        node.mockscheduler(EXTRA_PEER_CHECK_INTERVAL)
+        self.wait_until(lambda: not clock_warning(node))
+        node.disconnect_p2ps()
+
+        self.log.info("Test that after a clear, the warning tracks only the chain starts seen since")
+        node.setmocktime(mtp_low - MAX_FUTURE_BLOCK_TIME - 1)
+        p2p = node.add_p2p_connection(P2PInterface())
+        p2p.send_and_ping(low_work_headers(chain_starts[0].hash_int, chain_starts[0].nTime))
+        assert clock_warning(node)
+        node.setmocktime(mtp_low - MAX_FUTURE_BLOCK_TIME)
+        node.mockscheduler(EXTRA_PEER_CHECK_INTERVAL)
+        self.wait_until(lambda: not clock_warning(node))
+        node.disconnect_p2ps()
+        node.setmocktime(0)
 
     def test_large_reorgs_can_succeed(self):
         self.log.info("Test that a 2000+ block reorg, starting from a point that is more than 2000 blocks before a locator entry, can succeed")
@@ -185,6 +272,8 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         self.test_large_reorgs_can_succeed()
 
         self.test_peerinfo_includes_headers_presync_height()
+
+        self.test_clock_warning_clears_at_highest_chain_start()
 
 
 
