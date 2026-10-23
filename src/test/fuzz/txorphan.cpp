@@ -438,7 +438,9 @@ FUZZ_TARGET(txorphanage_sim)
                 if (child == t) {
                     auto& partx = txn[txorder[parent]];
                     assert(partx->version == 1);
-                    COutPoint outpoint(partx->GetHash(), rng.randrange<size_t>(partx->vout.size()));
+                    // Occasionally spend an output that the parent does not have.
+                    const size_t num_vout{partx->vout.size() + (rng.randrange(8) == 0 ? 2 : 0)};
+                    COutPoint outpoint(partx->GetHash(), rng.randrange<size_t>(num_vout));
                     tx.vin.emplace_back(outpoint);
                     tx.vin.back().scriptSig.resize(provider.ConsumeIntegralInRange<unsigned>(16, 200));
                 }
@@ -468,6 +470,14 @@ FUZZ_TARGET(txorphanage_sim)
         assert(weight < MAX_STANDARD_TX_WEIGHT);
         total_usage += GetTransactionWeight(*txn[txorder[t]]);
     }
+
+    /** Whether txn[child] spends an output that txn[parent] has. */
+    auto spends_output_of_fn = [&](unsigned child, unsigned parent) -> bool {
+        for (const auto& txin : txn[child]->vin) {
+            if (txin.prevout.hash == txn[parent]->GetHash() && txin.prevout.n < txn[parent]->vout.size()) return true;
+        }
+        return false;
+    };
 
     //
     // 3. Initialize real orphanage
@@ -634,14 +644,7 @@ FUZZ_TARGET(txorphanage_sim)
                 for (unsigned child_tx = 0; child_tx < NUM_TX; ++child_tx) {
                     if (!have_tx_fn(child_tx)) continue;
                     if (have_reconsiderable_fn(child_tx)) continue;
-                    bool child_of = false;
-                    for (auto& txin : txn[child_tx]->vin) {
-                        if (txin.prevout.hash == txn[tx]->GetHash()) {
-                            child_of = true;
-                            break;
-                        }
-                    }
-                    if (child_of) {
+                    if (spends_output_of_fn(child_tx, tx)) {
                         child_wtxids.insert(txn[child_tx]->GetWitnessHash());
                     }
                 }
@@ -785,11 +788,7 @@ FUZZ_TARGET(txorphanage_sim)
                 for (auto& ann : sim_announcements) {
                     if (ann.announcer != peer) continue;
                     if (ann.reconsider != (phase == 1)) continue;
-                    bool matching_parent{false};
-                    for (const auto& vin : txn[ann.tx]->vin) {
-                        if (vin.prevout.hash == txn[tx]->GetHash()) matching_parent = true;
-                    }
-                    if (!matching_parent) continue;
+                    if (!spends_output_of_fn(ann.tx, tx)) continue;
                     // Found an announcement from peer which is a child of txn[tx].
                     assert(it != children_from_peer.rend());
                     assert((*it)->GetWitnessHash() == txn[ann.tx]->GetWitnessHash());

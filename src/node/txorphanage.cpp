@@ -665,9 +665,9 @@ std::vector<CTransactionRef> TxOrphanageImpl::GetChildrenFromSamePeer(const CTra
     while (it_upper != it_lower) {
         --it_upper;
         if (!Assume(it_upper->m_announcer == peer)) break;
-        // Check if this tx spends from parent.
+        // Check if this tx spends an output of parent.
         for (const auto& input : it_upper->m_tx->vin) {
-            if (input.prevout.hash == parent_txid) {
+            if (input.prevout.hash == parent_txid && input.prevout.n < parent->vout.size()) {
                 children_found.emplace_back(it_upper->m_tx);
                 break;
             }

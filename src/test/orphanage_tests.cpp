@@ -664,6 +664,42 @@ BOOST_AUTO_TEST_CASE(get_children)
     }
 }
 
+BOOST_AUTO_TEST_CASE(get_children_missing_output)
+{
+    FastRandomContext det_rand{true};
+    std::vector<COutPoint> empty_outpoints;
+    const NodeId peer{0};
+
+    // This parent has 5 outputs, so there is no output with index 5 or above to spend.
+    CMutableTransaction mtx_parent{*MakeTransactionSpending(empty_outpoints, det_rand)};
+    mtx_parent.vout.resize(5);
+    const auto parent{MakeTransactionRef(mtx_parent)};
+    const auto other{MakeTransactionSpending(empty_outpoints, det_rand)};
+    const auto& txid{parent->GetHash()};
+
+    auto child_n1 = MakeTransactionSpending({{txid, 1}, {other->GetHash(), 0}}, det_rand);
+    auto child_n5_n7 = MakeTransactionSpending({{txid, 5}, {txid, 7}}, det_rand);
+    auto child_n0_n2 = MakeTransactionSpending({{txid, 0}, {txid, 2}}, det_rand);
+    auto child_n6_n3 = MakeTransactionSpending({{txid, 6}, {txid, 3}}, det_rand);
+    auto child_other_peer = MakeTransactionSpending({{txid, 0}}, det_rand);
+
+    auto orphanage{node::MakeTxOrphanage()};
+    BOOST_CHECK(orphanage->AddTx(child_n1, peer));
+    BOOST_CHECK(orphanage->AddTx(child_n5_n7, peer));
+    BOOST_CHECK(orphanage->AddTx(child_n0_n2, peer));
+    BOOST_CHECK(orphanage->AddTx(child_n6_n3, peer));
+    BOOST_CHECK(orphanage->AddTx(child_other_peer, peer + 1));
+    // Make child_n1 reconsiderable, so that it comes first.
+    BOOST_CHECK_EQUAL(orphanage->AddChildrenToWorkSet(*other, det_rand).size(), 1);
+
+    // A tx that only spends an output the parent does not have is not its child. A child that
+    // spends several outputs of the parent is returned once.
+    const std::vector<CTransactionRef> expected_children{child_n1, child_n6_n3, child_n0_n2};
+    BOOST_CHECK(expected_children == orphanage->GetChildrenFromSamePeer(parent, peer));
+    const std::vector<CTransactionRef> expected_other_peer{child_other_peer};
+    BOOST_CHECK(expected_other_peer == orphanage->GetChildrenFromSamePeer(parent, peer + 1));
+}
+
 BOOST_AUTO_TEST_CASE(too_large_orphan_tx)
 {
     std::unique_ptr<node::TxOrphanage> orphanage{node::MakeTxOrphanage()};

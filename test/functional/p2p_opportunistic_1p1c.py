@@ -610,6 +610,38 @@ class PackageRelayTest(BitcoinTestFramework):
         assert high_fee_child["txid"] in node_mempool
         assert_equal(node.getmempoolentry(low_fee_great_grandparent["txid"])["descendantcount"], 4)
 
+    def count_package_evaluations(self):
+        with open(self.nodes[0].debug_log_path, encoding="utf-8") as f:
+            return sum("package evaluation for" in line for line in f)
+
+    @cleanup
+    def test_1p1c_ignores_orphans_not_spending_parent_outputs(self):
+        self.log.info("Test that orphans that spend an output the parent does not have are not tried as its children")
+        node = self.nodes[0]
+        node.setmocktime(int(time.time()))
+
+        low_fee_parent = self.create_tx_below_mempoolminfee(self.wallet)
+        parent_tx = low_fee_parent["tx"]
+        assert_equal(len(parent_tx.vout), 1)
+
+        orphans = []
+        for i in range(15):
+            orphan = CTransaction()
+            orphan.vin = [CTxIn(COutPoint(parent_tx.txid_int, 1), nSequence=MAX_BIP125_RBF_SEQUENCE)]
+            orphan.vout = [CTxOut(1000 + i, CScript([OP_RETURN, b'a' * 3]))]
+            orphans.append(orphan)
+
+        peer = node.add_p2p_connection(P2PInterface())
+        peer.send_and_ping(msg_tx(parent_tx))
+        for orphan in orphans:
+            peer.send_and_ping(msg_tx(orphan))
+        assert_equal(len(node.getorphantxs()), len(orphans))
+
+        evaluations_before = self.count_package_evaluations()
+        for _ in range(2 * len(orphans)):
+            peer.send_and_ping(msg_tx(parent_tx))
+        assert_equal(self.count_package_evaluations() - evaluations_before, 0)
+
     def run_test(self):
         node = self.nodes[0]
         # To avoid creating transactions with the same txid (can happen if we set the same feerate
@@ -644,6 +676,7 @@ class PackageRelayTest(BitcoinTestFramework):
         self.test_multiple_parents()
         self.test_other_parent_in_mempool()
         self.test_1p1c_on_1p1c()
+        self.test_1p1c_ignores_orphans_not_spending_parent_outputs()
 
         self.test_orphanage_dos_large()
         self.test_orphanage_dos_many()
