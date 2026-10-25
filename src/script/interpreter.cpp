@@ -1910,7 +1910,7 @@ uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const u
     return k;
 }
 
-static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash)
+static bool VerifyTaprootCommitment(std::span<const unsigned char> control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash)
 {
     assert(control.size() >= TAPROOT_CONTROL_BASE_SIZE);
     assert(program.size() >= uint256::size());
@@ -1927,15 +1927,57 @@ static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, c
 static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh)
 {
     CScript exec_script; //!< Actually executed script (last stack item in P2WSH; implied P2PKH script in P2WPKH; leaf script in P2TR)
-    // The witness stack. Elements with other roles (the witness script, the annex, the control block,
-    // and the leaf script) are popped from it, and the remaining elements are moved into the initial
-    // execution stack.
-    auto stack = witness.ToVectors();
-    // Remove the top element from the stack, and return it.
+    // The witness stack, as a view of the bottom m_size elements of the witness, so that spends
+    // that do not reach ExecuteWitnessScript do not copy it. Elements with other roles (the
+    // witness script, the annex, the control block, and the leaf script) are popped from it and
+    // read in place, and the remaining elements are copied into the initial execution stack.
+    struct {
+        const CScriptWitness& m_witness;
+        size_t m_size;
+        // The two elements below the top of the witness (the deepest that are read after a pop), found
+        // in one forward pass the first time one is needed: only the top and the bottom have
+        // constant-time access.
+        std::span<const unsigned char> m_below_top[2]{};
+        bool m_below_top_init{false};
+        size_t size() const { return m_size; }
+        std::span<const unsigned char> front() const { return m_witness.front(); }
+        std::span<const unsigned char> back()
+        {
+            const size_t count{m_witness.size()};
+            const size_t popped{count - m_size};
+            if (popped == 0) return m_witness.back();
+            if (popped > 2) return m_witness[m_size - 1];
+            if (!m_below_top_init) {
+                size_t i{0};
+                for (const auto element : m_witness) {
+                    if (i + 3 == count) m_below_top[1] = element;
+                    if (i + 2 == count) {
+                        m_below_top[0] = element;
+                        break;
+                    }
+                    ++i;
+                }
+                m_below_top_init = true;
+            }
+            return m_below_top[popped - 1];
+        }
+        // Copy the remaining elements, when the stack is moved into ExecuteWitnessScript.
+        operator std::vector<valtype>() &&
+        {
+            std::vector<valtype> ret;
+            ret.reserve(m_size);
+            for (const auto element : m_witness) {
+                if (ret.size() == m_size) break;
+                ret.emplace_back(element.begin(), element.end());
+            }
+            return ret;
+        }
+    } stack{witness, witness.size()};
+    // Remove the top element from the stack, and return a view of it.
     const auto pop{[&] {
-        auto ret{std::move(stack.back())};
-        stack.pop_back();
-        return ret;
+        const auto top{stack.back()};
+        --stack.m_size;
+        return top;
     }};
     ScriptExecutionData execdata;
 
@@ -1945,7 +1987,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if (stack.size() == 0) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
             }
-            const valtype script_bytes = pop();
+            const auto script_bytes{pop()};
             exec_script = CScript(script_bytes.begin(), script_bytes.end());
             uint256 hash_exec_script;
             CSHA256().Write(exec_script.data(), exec_script.size()).Finalize(hash_exec_script.begin());
@@ -1969,8 +2011,12 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
         if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
             // Drop annex (this is non-standard; see IsWitnessStandard)
-            const valtype annex = pop();
-            execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
+            const auto annex{pop()};
+            // Hashed as a serialized byte vector: its length, then its bytes.
+            HashWriter annex_hasher{};
+            WriteCompactSize(annex_hasher, annex.size());
+            annex_hasher << annex;
+            execdata.m_annex_hash = annex_hasher.GetSHA256();
             execdata.m_annex_present = true;
         } else {
             execdata.m_annex_present = false;
@@ -1984,8 +2030,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_success(serror);
         } else {
             // Script path spending (stack size is >1 after removing optional annex)
-            const valtype control = pop();
-            const valtype script = pop();
+            const auto control{pop()};
+            const auto script{pop()};
             if (control.size() < TAPROOT_CONTROL_BASE_SIZE || control.size() > TAPROOT_CONTROL_MAX_SIZE || ((control.size() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE) != 0) {
                 return set_error(serror, SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE);
             }
