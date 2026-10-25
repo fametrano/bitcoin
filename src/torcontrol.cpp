@@ -34,6 +34,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -675,7 +676,11 @@ void TorController::protocolinfo_cb(TorControlConnection& _conn, const TorContro
         } else if (methods.contains("SAFECOOKIE")) {
             // Cookie: hexdump -e '32/1 "%02x""\n"'  ~/.tor/control_auth_cookie
             LogDebug(BCLog::TOR, "Using SAFECOOKIE authentication, reading cookie authentication from %s", cookiefile);
-            std::pair<bool,std::string> status_cookie = ReadBinaryFile(fs::PathFromString(cookiefile), TOR_COOKIE_SIZE);
+            // The reply chooses the path, and opening a FIFO there would block this thread.
+            const fs::path cookie_path{fs::PathFromString(cookiefile)};
+            std::error_code ec;
+            std::pair<bool,std::string> status_cookie;
+            if (fs::is_regular_file(cookie_path, ec)) status_cookie = ReadBinaryFile(cookie_path, TOR_COOKIE_SIZE);
             if (status_cookie.first && status_cookie.second.size() == TOR_COOKIE_SIZE) {
                 // _conn.Command("AUTHENTICATE " + HexStr(status_cookie.second), std::bind_front(&TorController::auth_cb, this));
                 m_cookie = std::vector<uint8_t>(status_cookie.second.begin(), status_cookie.second.end());

@@ -4,6 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test torcontrol functionality with a mock Tor control server."""
 from contextlib import contextmanager
+import os
 import socket
 import threading
 from test_framework.test_framework import BitcoinTestFramework
@@ -271,6 +272,43 @@ class TorControlTest(BitcoinTestFramework):
 
         mock_tor.stop()
 
+    def test_cookiefile(self):
+        class CookieServer(MockTorControlServer):
+            def __init__(self, port, cookiefile):
+                super().__init__(port)
+                # The node unescapes the backslashes of a Windows path.
+                self.cookiefile = cookiefile.replace("\\", "\\\\")
+
+            def _get_response(self, command):
+                if command == "PROTOCOLINFO 1":
+                    return (
+                        "250-PROTOCOLINFO 1\r\n"
+                        f"250-AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE=\"{self.cookiefile}\"\r\n"
+                        "250 OK\r\n"
+                    )
+                return super()._get_response(command)
+
+        self.log.info("Test that a regular COOKIEFILE is read")
+        cookie = os.path.join(self.options.tmpdir, "cookie")
+        with open(cookie, "wb") as f:
+            f.write(bytes(32))
+        mock_tor = CookieServer(self.next_port(), cookie)
+        self.restart_with_mock(mock_tor)
+        self.wait_until(lambda: len(mock_tor.received_commands) >= 2, timeout=10)
+        assert mock_tor.received_commands[1].startswith("AUTHCHALLENGE SAFECOOKIE ")
+        mock_tor.stop()
+
+        if not hasattr(os, "mkfifo"):
+            return
+        self.log.info("Test that a FIFO as COOKIEFILE is not opened and does not block shutdown")
+        fifo = os.path.join(self.options.tmpdir, "cookie.fifo")
+        os.mkfifo(fifo)
+        mock_tor = CookieServer(self.next_port(), fifo)
+        with self.nodes[0].assert_debug_log([f"Authentication cookie {fifo} could not be opened"], timeout=10):
+            self.restart_with_mock(mock_tor)
+        self.stop_node(0)
+        mock_tor.stop()
+
     def run_test(self):
         self.test_basic()
         self.test_partial_data()
@@ -278,6 +316,7 @@ class TorControlTest(BitcoinTestFramework):
         self.test_oversized_line()
         self.test_overmany_lines()
         self.test_reconnect_backoff()
+        self.test_cookiefile()
 
 
 if __name__ == '__main__':
