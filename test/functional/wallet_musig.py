@@ -338,6 +338,15 @@ class WalletMuSigTest(BitcoinTestFramework):
         assert "hex" in finalized
         self.nodes[0].sendrawtransaction(finalized["hex"])
 
+    def test_raw_signing_keeps_no_nonce(self):
+        self.log.info("Testing that signing a raw transaction keeps no MuSig2 nonce")
+        (wallet, _), _ = self.setup_musig_scenario("tr(musig($0/<0;1>/*,$1/<0;1>/*))")
+        utxo = wallet.listunspent()[0]
+        raw = self.nodes[0].createrawtransaction([{"txid": utxo["txid"], "vout": utxo["vout"]}], [{self.def_wallet.getnewaddress(): 5}])
+        locked_before = self.nodes[0].getmemoryinfo()["locked"]["used"]
+        assert_equal(wallet.signrawtransactionwithwallet(raw)["complete"], False)
+        assert_equal(self.nodes[0].getmemoryinfo()["locked"]["used"], locked_before)
+
     def run_test(self):
         self.def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
 
@@ -366,6 +375,7 @@ class WalletMuSigTest(BitcoinTestFramework):
         self.test_failure_case_1("missing participant nonce", "tr(musig($0/<0;1>/*,$1/<1;2>/*,$2/<2;3>/*))")
         self.test_failure_case_2("insufficient partial signatures", "rawtr(musig($0/<0;1>/*,$1/<1;2>/*,$2/<2;3>/*))")
         self.test_failure_case_3("finalize without partial sigs", "rawtr(musig($0/<0;1>/*,$1/<1;2>/*))")
+        self.test_raw_signing_keeps_no_nonce()
 
 if __name__ == '__main__':
     WalletMuSigTest(__file__).main()

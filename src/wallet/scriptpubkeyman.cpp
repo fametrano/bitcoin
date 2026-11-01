@@ -1376,6 +1376,10 @@ bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const s
         keys->Merge(std::move(*coin_keys));
     }
 
+    // A transaction has no field for a MuSig2 pubnonce, so no session started here can finish.
+    std::map<uint256, MuSig2SecNonce> discarded_secnonces;
+    keys->musig2_secnonces = &discarded_secnonces;
+
     return ::SignTransaction(tx, keys.get(), coins, {.sighash_type = sighash}, input_errors);
 }
 
