@@ -519,6 +519,11 @@ typedef uint32_t btck_TxValidationResult;
  * to point to user-defined structures to make processing the validation
  * callbacks easier. Note that these callbacks block any further validation
  * execution when they are called.
+ *
+ * Do not call btck_chainstate_manager_import_blocks or
+ * btck_chainstate_manager_process_block on the chainstate manager connecting a
+ * block from block_checked or block_connected. The call deadlocks or aborts
+ * the process.
  */
 typedef struct {
     void* user_data;                                              //!< Holds a user-defined opaque structure that is passed to the validation
@@ -544,6 +549,10 @@ typedef struct {
  * the user_data outlives the kernel objects. Notifications can
  * occur even as kernel objects are deleted, so care has to be taken to ensure
  * safe unwinding.
+ *
+ * Do not call btck_chainstate_manager_import_blocks or
+ * btck_chainstate_manager_process_block on the chainstate manager connecting a
+ * block from block_tip. The call deadlocks or aborts the process.
  */
 typedef struct {
     void* user_data;                        //!< Holds a user-defined opaque structure that is passed to the notification callbacks.
