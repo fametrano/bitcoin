@@ -45,6 +45,8 @@ class DescriptorTest(BitcoinTestFramework):
         assert_raises_rpc_error(-5, "Multi: Key ' 03774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb' is invalid due to whitespace", self.nodes[0].getdescriptorinfo, "wsh(multi(2,03a0434d9e47f3c86235477c7b1ae6ae5d3442d49b1943c2b752a68e2a47e247c7, 03774ae7f858a9411e5ef4246b70c65aac5649980be5c17891bbec17895da008cb,03d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a))")
         priv_key = generate_keypair(wif=True)[0]
         assert_raises_rpc_error(-5, f"pk(): Key ' {priv_key}' is invalid due to whitespace", self.nodes[0].getdescriptorinfo, f"pk( {priv_key})")
+        assert_raises_rpc_error(-5, "Unexpected ')' after the descriptor", self.nodes[0].getdescriptorinfo, "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798))")
+        assert_raises_rpc_error(-5, "sh(): unexpected ',' after the script expression", self.nodes[0].getdescriptorinfo, "sh(wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),x)")
 
         # P2PK output with the specified public key.
         self.test_desc('pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)', isrange=False, issolvable=True, hasprivatekeys=False)

@@ -2541,7 +2541,11 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
     }
     if (ctx == ParseScriptContext::TOP && Func("sh", expr)) {
         auto descs = ParseScript(key_exp_index, expr, ParseScriptContext::P2SH, out, error);
-        if (descs.empty() || expr.size()) return {};
+        if (descs.empty()) return {};
+        if (expr.size()) {
+            error = strprintf("sh(): unexpected '%c' after the script expression", expr[0]);
+            return {};
+        }
         std::vector<std::unique_ptr<DescriptorImpl>> ret;
         ret.reserve(descs.size());
         for (auto& desc : descs) {
@@ -2554,7 +2558,11 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
     }
     if ((ctx == ParseScriptContext::TOP || ctx == ParseScriptContext::P2SH) && Func("wsh", expr)) {
         auto descs = ParseScript(key_exp_index, expr, ParseScriptContext::P2WSH, out, error);
-        if (descs.empty() || expr.size()) return {};
+        if (descs.empty()) return {};
+        if (expr.size()) {
+            error = strprintf("wsh(): unexpected '%c' after the script expression", expr[0]);
+            return {};
+        }
         for (auto& desc : descs) {
             ret.emplace_back(std::make_unique<WSHDescriptor>(std::move(desc)));
         }
@@ -3014,6 +3022,10 @@ std::vector<std::unique_ptr<Descriptor>> Parse(std::string_view descriptor, Flat
     if (!CheckChecksum(sp, require_checksum, error)) return {};
     uint32_t key_exp_index = 0;
     auto ret = ParseScript(key_exp_index, sp, ParseScriptContext::TOP, out, error);
+    if (!ret.empty() && !sp.empty()) {
+        error = strprintf("Unexpected '%c' after the descriptor", sp[0]);
+        return {};
+    }
     if (sp.empty() && !ret.empty()) {
         std::vector<std::unique_ptr<Descriptor>> descs;
         descs.reserve(ret.size());
