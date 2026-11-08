@@ -21,6 +21,10 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#include <unistd.h>
+#endif
 
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 static constexpr bool SANITIZER_ALLOCATOR{true};
@@ -83,6 +87,10 @@ size_t MeasureMallocUsage(size_t size)
     std::vector<uintptr_t> addrs;
     blocks.reserve(count);
     addrs.reserve(count);
+#ifdef __APPLE__
+    malloc_statistics_t before, after;
+    malloc_zone_statistics(nullptr, &before);
+#endif
     // Nothing in this loop may allocate other than the malloc() calls being measured.
     for (size_t i{0}; i < count; ++i) {
         void* block{std::malloc(size)};
@@ -90,6 +98,9 @@ size_t MeasureMallocUsage(size_t size)
         blocks.push_back(block);
         addrs.push_back(reinterpret_cast<uintptr_t>(block));
     }
+#ifdef __APPLE__
+    malloc_zone_statistics(nullptr, &after);
+#endif
     for (void* block : blocks) std::free(block);
     BOOST_REQUIRE(std::find(blocks.begin(), blocks.end(), nullptr) == blocks.end());
 
@@ -97,6 +108,18 @@ size_t MeasureMallocUsage(size_t size)
     const size_t gap{DominantGap(addrs)};
     if (gap < PAGE) return gap;
 
+#ifdef __APPLE__
+    // macOS's libmalloc can place large blocks much further apart than they cost. On macOS 27.2, blocks of 2 MiB + 1
+    // byte to at least 3.87 MiB are 4 MiB + 16 KiB apart where measured, while the zones' size_in_use, and the task's
+    // physical footprint once the blocks are written, grow by the request rounded up to a page (the footprint by 1.5 to
+    // 18 KiB more). Where the spacing exceeds that growth by a page or more, use the growth instead.
+    if (after.size_in_use >= before.size_in_use) {
+        const size_t in_use{(after.size_in_use - before.size_in_use) / count};
+        static const size_t page{static_cast<size_t>(sysconf(_SC_PAGESIZE))};
+        if (gap >= in_use + page) return in_use;
+    }
+    return gap;
+#else
     // Some allocators (e.g. musl) give large blocks page-granular memory, but place each block at a varying offset
     // within it, so neighbouring blocks are somewhat closer or further apart than the memory they use. Such an
     // allocator gives a different address, less than a page away, when a block is freed and allocated again.
@@ -132,6 +155,7 @@ size_t MeasureMallocUsage(size_t size)
         hi = std::max(hi, deviation);
     }
     return spacing > 0 && hi - lo < intptr_t{PAGE} ? spacing : gap;
+#endif
 }
 
 /** Whether MallocUsage() is close enough to a measured usage. It may be at most a factor 1+1/16 below the
