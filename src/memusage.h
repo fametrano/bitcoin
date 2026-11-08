@@ -27,6 +27,11 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+// Declared in <malloc/malloc.h>, which is not included because the Mach headers it pulls in
+// define macros (such as BYTE_SIZE) that clash with names used in this codebase.
+extern "C" size_t malloc_good_size(size_t size);
+#endif
 
 namespace memusage
 {
@@ -114,15 +119,9 @@ static inline size_t MallocUsage(size_t alloc)
     static const size_t page{static_cast<size_t>(sysconf(_SC_PAGESIZE))};
     return round_up(alloc + header + group_header, page) + meta;
 #elif defined(__APPLE__)
-    // macOS's libmalloc keeps its metadata out of band, and rounds requests up to a quantum that
-    // depends on the size range: 16 bytes for tiny (and nano) allocations up to 1008 bytes, 512
-    // bytes for small ones up to 32 KiB, and 32 KiB for medium ones up to 8 MiB. Larger ones are
-    // mapped as whole pages. Checked against measurements on macOS 15 (arm64).
-    if (alloc <= 1008) return round_up(alloc, 16);
-    if (alloc <= 32 * 1024) return round_up(alloc, 512);
-    if (alloc <= 8 * 1024 * 1024) return round_up(alloc, 32 * 1024);
-    static const size_t page{static_cast<size_t>(sysconf(_SC_PAGESIZE))};
-    return round_up(alloc, page);
+    // macOS's libmalloc keeps its metadata out of band, and its size classes differ between macOS
+    // releases, so ask it which block size it would use for this request.
+    return malloc_good_size(alloc);
 #elif defined(_WIN64)
     // The Windows heap, which the UCRT's malloc uses. Its blocks have an (effectively) 8-byte
     // header and a 16-byte granularity, but many live allocations of up to 16 KiB come from its
